@@ -15,7 +15,7 @@ from src.m2_search import HybridSearch
 from src.m3_rerank import CrossEncoderReranker
 from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_report
 from src.m5_enrichment import enrich_chunks
-from config import RERANK_TOP_K
+from config import COLLECTION_NAME, RERANK_TOP_K
 
 
 def build_pipeline():
@@ -31,8 +31,16 @@ def build_pipeline():
     all_chunks = []
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        parent_text_by_id = {parent.metadata["parent_id"]: parent.text for parent in parents}
         for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
+            all_chunks.append({
+                "text": child.text,
+                "metadata": {
+                    **child.metadata,
+                    "parent_id": child.parent_id,
+                    "parent_text": parent_text_by_id.get(child.parent_id, child.text),
+                },
+            })
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
@@ -61,12 +69,52 @@ def build_pipeline():
     return search, reranker
 
 
+def load_indexed_pipeline():
+    """Reuse the current Qdrant collection and rebuild only the in-memory BM25 index."""
+    parent_text_by_id = {}
+    for document in load_documents():
+        parents, _ = chunk_hierarchical(document["text"], metadata=document["metadata"])
+        parent_text_by_id.update({parent.metadata["parent_id"]: parent.text for parent in parents})
+
+    search = HybridSearch()
+    points, _ = search.dense.client.scroll(
+        collection_name=COLLECTION_NAME,
+        limit=10_000,
+        with_payload=True,
+        with_vectors=False,
+    )
+    chunks = []
+    for point in points:
+        payload = dict(point.payload or {})
+        text = payload.pop("text", "")
+        payload["parent_text"] = parent_text_by_id.get(payload.get("parent_id"), text)
+        chunks.append({"text": text, "metadata": payload})
+    if not chunks:
+        raise RuntimeError(f"Qdrant collection '{COLLECTION_NAME}' is empty; run build_pipeline() first")
+    search.bm25.index(chunks)
+    print(f"Reused {len(chunks)} indexed chunks with parent context", flush=True)
+    return search, CrossEncoderReranker()
+
+
 def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
     """Run single query through pipeline."""
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
-    reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    reranked = reranker.rerank(query, docs, top_k=max(RERANK_TOP_K * 3, RERANK_TOP_K))
+    ranked_docs = reranked if reranked else results
+    contexts = []
+    seen_parents = set()
+    for result in ranked_docs:
+        metadata = result.metadata
+        parent_id = metadata.get("parent_id", result.text)
+        if parent_id in seen_parents:
+            continue
+        seen_parents.add(parent_id)
+        context = metadata.get("parent_text", result.text)
+        source = metadata.get("source", "")
+        contexts.append(f"[Nguồn: {source}]\n{context}" if source else context)
+        if len(contexts) >= RERANK_TOP_K:
+            break
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
@@ -75,9 +123,14 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             client = OpenAI()
             context_str = "\n\n".join(contexts)
             resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+                {"role": "system", "content": (
+                    "Trả lời trực tiếp bằng tiếng Việt, CHỈ dựa trên context. "
+                    "Hãy tổng hợp nhiều đoạn và thực hiện phép tính đơn giản nếu câu hỏi yêu cầu. "
+                    "Nếu có nhiều phiên bản, ưu tiên nguồn có năm/phiên bản mới nhất và nói rõ bản cũ đã bị thay thế. "
+                    "Chỉ nói 'Không tìm thấy.' khi tất cả context đều không có dữ kiện liên quan."
+                )},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
+            ], temperature=0)
             answer = resp.choices[0].message.content
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}", flush=True)

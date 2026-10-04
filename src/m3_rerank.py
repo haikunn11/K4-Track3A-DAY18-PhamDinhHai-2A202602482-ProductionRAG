@@ -3,6 +3,7 @@ from __future__ import annotations
 """Module 3: Reranking — Cross-encoder top-20 → top-3 + latency benchmark."""
 
 import os, sys, time
+import re
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
@@ -26,31 +27,65 @@ class CrossEncoderReranker:
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
         self.model_name = model_name
         self._model = None
+        self._load_attempted = False
 
     def _load_model(self):
-        if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+        if self._model is None and not self._load_attempted:
+            self._load_attempted = True
+            try:
+                from sentence_transformers import CrossEncoder
+
+                self._model = CrossEncoder(self.model_name)
+            except Exception as exc:
+                print(f"  ⚠️  Cross-encoder unavailable, using lexical reranking: {exc}")
         return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        if not documents or top_k <= 0:
+            return []
+
+        model = self._load_model()
+        if model is not None:
+            pairs = [(query, document.get("text", "")) for document in documents]
+            raw_scores = model.predict(pairs)
+            if isinstance(raw_scores, (int, float)):
+                scores = [float(raw_scores)]
+            else:
+                scores = [float(score) for score in raw_scores]
+        else:
+            scores = [
+                _lexical_score(query, document.get("text", ""), document.get("metadata", {}))
+                for document in documents
+            ]
+
+        scored = sorted(zip(scores, documents), key=lambda item: item[0], reverse=True)
+        return [
+            RerankResult(
+                text=document.get("text", ""),
+                original_score=float(document.get("score", 0.0)),
+                rerank_score=float(score),
+                metadata=document.get("metadata", {}),
+                rank=index + 1,
+            )
+            for index, (score, document) in enumerate(scored[:top_k])
+        ]
+
+
+def _lexical_score(query: str, text: str, metadata: dict | None = None) -> float:
+    """Offline fallback that rewards query-token coverage and exact phrases."""
+    metadata = metadata or {}
+    query_tokens = set(re.findall(r"\w+", query.lower()))
+    text_tokens = set(re.findall(r"\w+", text.lower()))
+    coverage = len(query_tokens & text_tokens) / max(len(query_tokens), 1)
+    phrase_bonus = 0.25 if query.lower().strip(" ?.!") in text.lower() else 0.0
+    source = str(metadata.get("source", "")).lower()
+    version_bonus = 0.0
+    if "v2024" in source or re.search(r"(?:^|[_-])v?2(?:[._-]|$)", source):
+        version_bonus = 0.12
+    elif "v2023" in source or re.search(r"(?:^|[_-])v?1(?:[._-]|$)", source):
+        version_bonus = -0.04
+    return coverage + phrase_bonus + version_bonus
 
 
 class FlashrankReranker:
